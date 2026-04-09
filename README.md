@@ -34,7 +34,7 @@ This extension adds a one-click workflow: select chapters, click merge, get a si
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/academic-book-pdf-merger.git
+   git clone https://github.com/gr0esch/Academic-Book-PDF-Merger.git
    ```
 2. Open Chrome and navigate to `chrome://extensions/`
 3. Enable **Developer mode** (toggle in the top-right corner)
