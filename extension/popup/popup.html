@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Academic PDF Merger</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Academic PDF Merger</h1>
+    </header>
+
+    <!-- Current tab: chapter selection -->
+    <div id="notBookPage" class="message hidden">
+      <p>Navigate to an Oxford Academic book page to use this extension.</p>
+    </div>
+
+    <div id="chapterList" class="hidden">
+      <p id="bookTitle" class="book-title"></p>
+      <div class="controls">
+        <button id="selectAll" class="btn btn-sm">Select All</button>
+        <button id="deselectAll" class="btn btn-sm">Deselect All</button>
+        <span id="selectedCount" class="count"></span>
+      </div>
+      <div id="chapters" class="chapters"></div>
+      <div class="actions">
+        <button id="downloadBtn" class="btn btn-primary">Download & Merge PDF</button>
+      </div>
+    </div>
+
+    <!-- Job queue -->
+    <div id="jobQueue" class="hidden">
+      <div class="queue-header">
+        <h2>Jobs</h2>
+        <button id="clearDoneBtn" class="btn btn-sm">Clear finished</button>
+      </div>
+      <div id="jobList"></div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

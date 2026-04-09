@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Academic PDF Merger — Settings</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+      padding: 20px;
+      max-width: 400px;
+      color: #333;
+    }
+    h2 {
+      color: #002f65;
+      margin-bottom: 16px;
+    }
+    label {
+      display: block;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    input, select {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      margin-bottom: 14px;
+      font-size: 13px;
+    }
+    .hint {
+      font-size: 11px;
+      color: #888;
+      margin-top: -10px;
+      margin-bottom: 14px;
+    }
+    button {
+      background: #002f65;
+      color: #fff;
+      border: none;
+      padding: 8px 20px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:hover {
+      background: #001d42;
+    }
+    .saved {
+      color: #2e7d32;
+      margin-left: 10px;
+      font-size: 13px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <h2>Academic PDF Merger Settings</h2>
+
+  <label for="downloadFolder">Download subfolder</label>
+  <input type="text" id="downloadFolder" placeholder="Academic_Books">
+  <p class="hint">Subfolder inside your default Downloads directory. Leave empty to save directly to Downloads.</p>
+
+  <label for="delayMs">Delay between requests (ms)</label>
+  <input type="number" id="delayMs" min="0" max="5000" step="100" placeholder="500">
+  <p class="hint">Delay between chapter page fetches to avoid rate limiting. Recommended: 300-1000 ms.</p>
+
+  <label for="saveAs">Show "Save As" dialog</label>
+  <select id="saveAs">
+    <option value="false">No (auto-save to folder)</option>
+    <option value="true">Yes (prompt each time)</option>
+  </select>
+
+  <div>
+    <button id="saveBtn">Save</button>
+    <span id="savedMsg" class="saved">Saved!</span>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
