@@ -16,6 +16,20 @@
   let bookData = null;
   let activeTabId = null;
   let pollTimer = null;
+  // Job IDs whose log is currently expanded — persists across the 500ms poll re-renders
+  const expandedLogs = new Set();
+  // Job IDs whose "Copy log" button is currently showing the "Copied!" feedback state
+  const copiedFeedback = new Set();
+
+  function buildLogText(job) {
+    const lines = [];
+    lines.push(`# ${job.bookTitle}`);
+    lines.push(`Status: ${job.phase}`);
+    if (job.errorMsg) lines.push(`Error: ${job.errorMsg}`);
+    lines.push("");
+    (job.logs || []).forEach(({ text }) => lines.push(text));
+    return lines.join("\n");
+  }
 
   // --- Settings ---
 
@@ -168,6 +182,10 @@
         provider: bookData.provider,
         pdfLinkSelector: bookData.pdfLinkSelector,
         pdfLinkFallback: bookData.pdfLinkFallback,
+        pdfMetaName: bookData.pdfMetaName,
+        bookId: bookData.bookId,
+        zipUrlTemplate: bookData.zipUrlTemplate,
+        fetchMethod: bookData.fetchMethod,
       },
     });
   });
@@ -246,23 +264,44 @@
       }
 
       // Expandable log
+      const isOpen = expandedLogs.has(job.id);
       const toggle = document.createElement("button");
       toggle.className = "btn btn-sm job-log-toggle";
-      toggle.textContent = "Show log";
+      toggle.textContent = isOpen ? "Hide log" : "Show log";
       toggle.addEventListener("click", () => {
         const logEl = card.querySelector(".job-log");
-        if (logEl.classList.contains("hidden")) {
-          logEl.classList.remove("hidden");
-          toggle.textContent = "Hide log";
-        } else {
+        if (expandedLogs.has(job.id)) {
+          expandedLogs.delete(job.id);
           logEl.classList.add("hidden");
           toggle.textContent = "Show log";
+        } else {
+          expandedLogs.add(job.id);
+          logEl.classList.remove("hidden");
+          toggle.textContent = "Hide log";
         }
       });
       card.appendChild(toggle);
 
+      const copyBtn = document.createElement("button");
+      copyBtn.className = "btn btn-sm job-log-copy";
+      copyBtn.textContent = copiedFeedback.has(job.id) ? "Copied!" : "Copy log";
+      copyBtn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(buildLogText(job));
+          copiedFeedback.add(job.id);
+          refreshJobs();
+          setTimeout(() => {
+            copiedFeedback.delete(job.id);
+            refreshJobs();
+          }, 1500);
+        } catch (e) {
+          copyBtn.textContent = "Copy failed";
+        }
+      });
+      card.appendChild(copyBtn);
+
       const logDiv = document.createElement("div");
-      logDiv.className = "job-log hidden";
+      logDiv.className = "job-log" + (isOpen ? "" : " hidden");
       (job.logs || []).forEach(({ text, cls }) => {
         const p = document.createElement("p");
         p.className = cls || "";
@@ -277,6 +316,8 @@
         removeBtn.className = "btn btn-sm job-remove";
         removeBtn.textContent = "Dismiss";
         removeBtn.addEventListener("click", () => {
+          expandedLogs.delete(job.id);
+          copiedFeedback.delete(job.id);
           chrome.runtime.sendMessage({ action: "clearJob", jobId: job.id });
           refreshJobs();
         });

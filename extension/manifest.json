@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Academic Book PDF Merger",
-  "version": "1.0.0",
-  "description": "Download and merge chapter PDFs from academic publisher book pages into a single PDF. Supports Oxford Academic (OUP).",
+  "version": "1.1.0",
+  "description": "Download and merge chapter PDFs from academic publisher book pages into a single PDF. Supports Oxford Academic (OUP) and Cambridge University Press (CUP).",
   "permissions": [
     "activeTab",
     "downloads",
@@ -15,7 +15,8 @@
   "host_permissions": [
     "*://*.silverchair.com/*",
     "*://*.oxfordacademic.com/*",
-    "*://*.oup.com/*"
+    "*://*.oup.com/*",
+    "*://*.cambridge.org/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",

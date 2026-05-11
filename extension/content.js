@@ -69,12 +69,112 @@
         };
       },
     },
-    // --- Add new publishers here ---
-    // {
-    //   name: "Cambridge University Press",
-    //   detect() { return false; },
-    //   scrape() { return null; },
-    // },
+    {
+      name: "Cambridge University Press",
+      detect() {
+        return (
+          document.querySelector("#downloadSelectedProductParts[data-downloadcontextid]") !== null ||
+          document.querySelector("div.representation.overview input[name='productParts']") !== null
+        );
+      },
+      scrape() {
+        const downloadBtn = document.querySelector(
+          "#downloadSelectedProductParts[data-downloadcontextid]"
+        );
+        const bookIdFromBtn = downloadBtn ? downloadBtn.dataset.downloadcontextid : "";
+        const bookIdFromUrl =
+          window.location.pathname.match(/\/core\/books\/[^/]+\/([A-F0-9]+)/i)?.[1] || "";
+        const bookId = bookIdFromBtn || bookIdFromUrl;
+        if (!bookId) return null;
+
+        const rows = document.querySelectorAll("div.representation.overview");
+        if (rows.length === 0) return null;
+
+        const titleEl =
+          document.querySelector("h1.book-title") ||
+          document.querySelector("meta[name='citation_book_title']") ||
+          document.querySelector("title");
+        let bookTitle = "Untitled Book";
+        if (titleEl) {
+          bookTitle = (titleEl.getAttribute("content") || titleEl.textContent || "")
+            .trim()
+            .replace(/\s*[|\-]\s*Cambridge Core.*$/i, "")
+            .replace(/\s*\|.*$/, "");
+        }
+
+        const baseUrl = window.location.origin;
+        const chapters = [];
+        let currentSection = "";
+
+        rows.forEach((row) => {
+          const checkbox = row.querySelector("input[name='productParts'][data-prod-id]");
+          if (!checkbox) return;
+
+          const prodId = checkbox.dataset.prodId;
+          const hasPdf = checkbox.dataset.hasPdf === "true";
+          const fileSize = parseInt(checkbox.dataset.fileSize || "0", 10);
+
+          const link = row.querySelector("a.part-link");
+          const href = link ? link.getAttribute("href") : "";
+          // Title text is the direct text content of the anchor, excluding the page-range div
+          let title = "";
+          if (link) {
+            const clone = link.cloneNode(true);
+            clone.querySelectorAll(".pages").forEach((n) => n.remove());
+            title = clone.textContent.replace(/\s+/g, " ").trim();
+          }
+          const pagesEl = row.querySelector(".pages");
+          const pages = pagesEl ? pagesEl.textContent.trim() : "";
+
+          // Indent-0 = section / part header or standalone; indent-1+ = child chapter.
+          // Treat any indent-0 row whose immediate following sibling is indent-1+ as a section parent.
+          const isTopLevel = row.classList.contains("indent-0");
+          let isSectionHeader = false;
+          if (isTopLevel) {
+            const next = row.nextElementSibling;
+            if (
+              next &&
+              next.classList.contains("representation") &&
+              !next.classList.contains("indent-0")
+            ) {
+              isSectionHeader = true;
+              currentSection = title;
+            } else {
+              currentSection = "";
+            }
+          }
+
+          if (!hasPdf || !prodId) return;
+
+          chapters.push({
+            id: prodId,
+            number: "",
+            title: title || "Untitled",
+            section: isTopLevel ? "" : currentSection,
+            href: href ? (href.startsWith("http") ? href : baseUrl + href) : "",
+            pages,
+            fileSize,
+          });
+        });
+
+        if (chapters.length === 0) return null;
+
+        return {
+          provider: "cup",
+          bookId,
+          bookTitle,
+          baseUrl,
+          chapters,
+          // ZIP-first path: comma-join selected chapter IDs in order, then book ID
+          zipUrlTemplate: `${baseUrl}/core/services/aop-cambridge-core/content/download/pdf/zip/{IDS}/${bookId}`,
+          // Per-chapter fallback: chapter page exposes the PDF URL via citation_pdf_url meta
+          pdfMetaName: "citation_pdf_url",
+          // CUP session cookies are SameSite-restricted — fetch from the page context,
+          // not from the service worker or a fresh hidden tab.
+          fetchMethod: "page",
+        };
+      },
+    },
   ];
 
   // --- Main ---
