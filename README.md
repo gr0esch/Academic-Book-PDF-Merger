@@ -15,7 +15,7 @@ This extension adds a one-click workflow: select chapters, click merge, get a si
 | Publisher | Status | Domain |
 |-----------|--------|--------|
 | Oxford Academic (OUP) | Supported | `academic.oup.com` |
-| Cambridge University Press | Planned | |
+| Cambridge University Press (CUP) | Supported | `cambridge.org` |
 | Springer | Planned | |
 | Wiley | Planned | |
 
