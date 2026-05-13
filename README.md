@@ -16,6 +16,7 @@ This extension adds a one-click workflow: select chapters, click merge, get a si
 |-----------|--------|--------|
 | Oxford Academic (OUP) | Supported | `academic.oup.com` |
 | Cambridge University Press (CUP) | Supported | `cambridge.org` |
+| JSTOR     | Planned ([#4](https://github.com/gr0esch/Academic-Book-PDF-Merger/issues/4)) | |
 | Springer | Planned | |
 | Wiley | Planned | |
 
