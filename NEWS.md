@@ -5,9 +5,19 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.1] — 2026-10-30
 
 ### Added
+
+- **De Gruyter Brill provider** for book pages at `degruyterbrill.com/document/doi/.../html`.
+  - Reads the ordered table of contents, including part headings and page ranges,
+    and uses the PDF URLs exposed by the page.
+  - Respects the page's access indicators: chapters without access are shown
+    unchecked and skipped without making a request.
+  - Uses the full-book PDF when all chapters are selected, with a per-chapter
+    fallback when the bulk download fails.
+  - Detects AWS WAF challenges and reports an actionable message instead of
+    continuing to request chapters.
 
 - **JSTOR provider** for book pages at `jstor.org/stable/<bookId>`
   ([#4](https://github.com/gr0esch/Academic-Book-PDF-Merger/issues/4)).
