@@ -203,6 +203,8 @@
         retryStatuses: bookData.retryStatuses,
         retryBaseDelayMs: bookData.retryBaseDelayMs,
         abortOnBlock: bookData.abortOnBlock,
+        concurrency: bookData.concurrency,
+        directFetch: bookData.directFetch,
       },
     });
   });
