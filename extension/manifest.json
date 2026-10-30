@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Academic Book PDF Merger",
   "version": "1.1.0",
-  "description": "Download and merge chapter PDFs from academic publisher book pages into a single PDF. Supports Oxford Academic (OUP), Cambridge University Press (CUP), and De Gruyter Brill.",
+  "description": "Download and merge chapter PDFs from academic publisher book pages into a single PDF. Supports Oxford Academic (OUP), Cambridge University Press (CUP), De Gruyter Brill, and JSTOR.",
   "permissions": [
     "activeTab",
     "downloads",
@@ -17,7 +17,8 @@
     "*://*.oxfordacademic.com/*",
     "*://*.oup.com/*",
     "*://*.cambridge.org/*",
-    "*://*.degruyterbrill.com/*"
+    "*://*.degruyterbrill.com/*",
+    "*://*.jstor.org/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",
