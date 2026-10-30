@@ -5,6 +5,31 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **JSTOR provider** for book pages at `jstor.org/stable/<bookId>`
+  ([#4](https://github.com/gr0esch/Academic-Book-PDF-Merger/issues/4)).
+  - Reads the server-rendered TOC (`div.toc-item[data-doi]`), including part headings,
+    chapter labels and page ranges; falls back to the page's JSON-LD `hasPart` list,
+    and to the whole-book PDF for books without chapter entries.
+  - Per-chapter access comes from the page's own state (`childDoiAccessExperienceMap`,
+    `openAccessDois`, `freeDois`): chapters outside your access start unchecked and are
+    tagged "no access"; open-access chapters are tagged.
+  - PDF URLs (`/stable/pdf/<id>.pdf`) are built from the current origin and fetched
+    inside the book tab (`fetchMethod: "page"`). Nothing institution-specific is used.
+  - Terms-and-conditions and captcha / bot-check pages stop the job with an
+    actionable message instead of a PDF parse error.
+- **Provider contract:** optional per-chapter `accessible` (`false` = shown unchecked but
+  still requestable, unlike De Gruyter Brill's `noAccess`, which is skipped) and `access`
+  (display label in the popup); optional pacing fields `minDelayMs`, `retryStatuses`,
+  `retryBaseDelayMs`; and `abortOnBlock`. Other providers don't set them and behave as before.
+
+### Manifest
+
+- Added `*://*.jstor.org/*` to `host_permissions`.
+
 ## [1.1.0] — 2026-05-11
 
 ### Added

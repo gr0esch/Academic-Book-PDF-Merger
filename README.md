@@ -16,10 +16,10 @@ This extension adds a one-click workflow: select chapters, click merge, get a si
 |-----------|--------|--------|
 | Oxford Academic (OUP) | Supported | `academic.oup.com` |
 | Cambridge University Press (CUP) | Supported | `cambridge.org` |
-| JSTOR     | Planned ([#4](https://github.com/gr0esch/Academic-Book-PDF-Merger/issues/4)) | |
+| De Gruyter Brill | Supported | `degruyterbrill.com` |
+| JSTOR | Supported | `jstor.org` (books only) |
 | Springer | Planned | |
 | Wiley | Planned | |
-| De Gruyter Brill | Supported | `degruyterbrill.com` |
 
 ## Features
 
@@ -64,15 +64,24 @@ Right-click the extension icon and select **Options**, or go to `chrome://extens
 | Setting | Default | Description |
 |---------|---------|-------------|
 | Download subfolder | `Academic_Books` | Subfolder within your Downloads directory |
-| Request delay | `500ms` | Delay between chapter fetches to avoid rate limiting |
+| Request delay | `500ms` | Delay between chapter fetches to avoid rate limiting (JSTOR always uses at least 3s) |
 | Save As dialog | Off | Whether to show a file picker for each merged PDF |
+
+### JSTOR notes
+
+- Works on book pages (`jstor.org/stable/<book id>`) for any kind of access: institutional IP range, Shibboleth/OpenAthens login, or a personal JSTOR account. Journal articles and journal issues are not handled.
+- Chapters JSTOR marks as outside your access are listed but unchecked, tagged "no access"; open-access chapters are tagged "open access".
+- The first time you download from JSTOR in a session, JSTOR may ask you to accept its Terms and Conditions. The extension does not accept them for you: if the job stops with that message, click **Download** on one chapter in the book tab, accept, and start the merge again.
+- To avoid JSTOR's bot protection, requests are spaced at least 3 seconds apart (with jitter), 403/429 responses are retried with backoff, and the job stops immediately if a captcha or bot check appears.
+- If you reach JSTOR through a proxy that rewrites the hostname (e.g. `www-jstor-org.ezproxy.<university>.edu`), the page is outside the extension's host permissions and may not work.
 
 ## How It Works
 
 1. **Content script** detects the publisher and scrapes the chapter list from the book's table of contents page
 2. **Background service worker** orchestrates the merge job:
-   - Finds each chapter's PDF URL: taken straight from the table of contents where the publisher lists it (De Gruyter Brill), otherwise by fetching the chapter page (in the page's context, with your session cookies)
-   - Downloads each PDF either in a hidden background tab (OUP) or with a fetch from your own book tab (CUP, De Gruyter Brill), so your session cookies and any bot-protection token are sent; responses are checked to really be PDFs
+   - Finds each chapter's PDF URL: taken straight from the table of contents where the publisher lists it (De Gruyter Brill, JSTOR), otherwise by fetching the chapter page (in the page's context, with your session cookies)
+   - Downloads each PDF either in a hidden background tab (OUP) or with a fetch from your own book tab (CUP, De Gruyter Brill, JSTOR), so your session cookies and any bot-protection token are sent
+   - Checks that every download really is a PDF (`%PDF-` header) and reports paywall, terms-acceptance and captcha pages clearly
    - Uses a single bulk download instead when the publisher offers one (CUP chapter ZIP; De Gruyter Brill full-book PDF when all chapters are selected)
    - Merges all PDFs in order using pdf-lib
    - Triggers the final download via the Chrome downloads API
@@ -117,6 +126,7 @@ extension/
    ```
 3. Add the publisher's domain to `host_permissions` in `manifest.json`
 4. The background worker handles the rest -- it uses the `pdfLinkSelector` from your provider to find PDF links on chapter pages
+5. Optional fields (see the CUP and JSTOR providers): `pdfMetaName`, `zipUrlTemplate`, `fetchMethod: "page"`; per chapter `pdfUrl` (skip the chapter-page lookup) and `accessible: false` (start unchecked) with an `access` label; pacing `minDelayMs`, `retryStatuses`, `retryBaseDelayMs`; and `abortOnBlock` (stop the job on terms or captcha pages). New fields must also be forwarded in `popup.js` (`providerInfo`)
 
 ## Requirements
 

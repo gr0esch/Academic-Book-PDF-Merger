@@ -285,7 +285,8 @@
             href: toLocalUrl(anchor.getAttribute("href") || `/document/doi/${doi}/html`),
             pdfUrl: toLocalUrl(pdfLink.getAttribute("href")),
             pages,
-            access,
+            // Internal state; `access` is reserved for the popup's display label.
+            accessState: access,
             noAccess: access === "none",
           });
         });
@@ -321,6 +322,268 @@
           // A non-PDF (HTML) answer to a PDF URL means login wall / landing page.
           noAccessOnHtml: true,
         };
+      },
+    },
+    {
+      name: "JSTOR",
+      // Book TOC pages live at /stable/<bookId> (e.g. /stable/j.ctvcm4j72) or
+      // /stable/10.xxxx/<suffix> for publisher DOIs. Journal articles, chapter pages and
+      // journal issue TOCs share the /stable/ prefix, so detection additionally
+      // requires a "this is a book" signal from the page's JSON-LD or SvelteKit state.
+      detect() {
+        if (!/^\/stable\/(?!pdf\/)./.test(window.location.pathname)) return false;
+        if (!this._isJstorSite()) return false;
+        const ld = this._bookJsonLd();
+        if (ld) return true;
+        const state = this._stateText();
+        return /\bitemType:\s*"book"/.test(state) && /\bvariant:\s*"toc"/.test(state);
+      },
+      scrape() {
+        const origin = window.location.origin;
+        const ld = this._bookJsonLd();
+        const access = this._accessState();
+
+        // Book title: JSON-LD name > visible <h1> heading > <title> minus " | JSTOR".
+        const headingEl = document.querySelector("jdp-pharos-heading[level='1']");
+        const titleEl = document.querySelector("title");
+        const bookTitle =
+          this._clean(ld && (ld.name || ld.headline)) ||
+          this._clean(headingEl && headingEl.textContent) ||
+          this._clean(titleEl && titleEl.textContent).replace(/\s*\|\s*JSTOR\s*$/i, "") ||
+          "Untitled Book";
+
+        // Book ID from the canonical URL (falls back to the current path). Only the path
+        // is used, so the code is indifferent to how the user authenticated.
+        const canonical = document.querySelector("link[rel='canonical']");
+        const bookPath = this._samePath(
+          (canonical && canonical.getAttribute("href")) || window.location.pathname
+        );
+        const bookId = (bookPath.match(/^\/stable\/(.+?)\/?$/) || [])[1] || "";
+        const bookDoi = (ld && this._ldDoi(ld)) || (bookId.startsWith("10.") ? bookId : `10.2307/${bookId}`);
+        const bookIsOpen = access.openDois.has(bookDoi) || access.freeDois.has(bookDoi);
+
+        const chapters = [];
+        const seen = new Set();
+        const addChapter = (ch) => {
+          if (!ch.doi || seen.has(ch.doi) || ch.doi === bookDoi) return;
+          seen.add(ch.doi);
+          const acc = this._chapterAccess(ch.doi, access, bookIsOpen);
+          chapters.push({
+            id: ch.doi.replace(/^10\.2307\//, ""),
+            number: ch.number || "",
+            title: ch.title || "Untitled",
+            section: ch.section || "",
+            href: ch.href || "",
+            pages: ch.pages || "",
+            // Direct PDF URL: background skips the "find PDF link" round-trip.
+            pdfUrl: ch.pdfUrl || this._pdfUrlFromDoi(ch.doi),
+            accessible: acc.accessible,
+            access: acc.label,
+          });
+        };
+
+        // 1) Server-rendered TOC: div.toc-item[data-doi] inside ol.toc-export-list.
+        document.querySelectorAll("div.toc-item[data-doi]").forEach((item) => {
+          const doi = (item.getAttribute("data-doi") || "").trim();
+          const link = item.querySelector("[data-qa='content title']");
+          let number = "";
+          let title = "";
+          if (link) {
+            const outer = link.querySelector(":scope > span") || link;
+            const inner = outer.querySelector(":scope > span");
+            title = this._clean(inner ? inner.textContent : outer.textContent);
+            if (inner) {
+              const clone = outer.cloneNode(true);
+              clone.querySelectorAll(":scope > span").forEach((n) => n.remove());
+              number = this._clean(clone.textContent).replace(/^chapter\s+/i, "");
+            }
+          }
+          if (!title) {
+            const lbl = item.querySelector("span[slot='label']");
+            title = this._clean(lbl && lbl.textContent);
+          }
+          const pagesEl = item.querySelector(".toc-page-range");
+          const pages = this._clean(pagesEl && pagesEl.textContent)
+            .replace(/^\(\s*(pp?\.\s*)?/i, "")
+            .replace(/\)$/, "");
+          const linkHref = link && link.getAttribute("href");
+          const href = linkHref ? origin + this._samePath(linkHref) : "";
+          const pdfA = item.querySelector("a[href*='/stable/pdf/']");
+          let pdfUrl = "";
+          if (pdfA) pdfUrl = origin + this._samePath(pdfA.getAttribute("href"));
+          else if (linkHref && /^\/stable\/(?!pdf\/)/.test(this._samePath(linkHref))) {
+            pdfUrl = origin + this._samePath(linkHref).replace(/^\/stable\//, "/stable/pdf/") + ".pdf";
+          }
+          addChapter({
+            doi,
+            number,
+            title,
+            section: this._sectionFor(item),
+            href,
+            pages,
+            pdfUrl,
+          });
+        });
+
+        // 2) Fallback: JSON-LD hasPart (flat list, no part headings).
+        if (chapters.length === 0 && ld && Array.isArray(ld.hasPart)) {
+          ld.hasPart.forEach((part) => {
+            const doi = this._ldDoi(part);
+            if (!doi) return;
+            const stablePath = `/stable/${doi.replace(/^10\.2307\//, "")}`;
+            addChapter({
+              doi,
+              title: this._clean(part.name),
+              href: origin + stablePath,
+              pages: this._clean(part.pagination),
+            });
+          });
+        }
+
+        // 3) Last resort: a book without a chapter-level TOC — offer the whole-book PDF.
+        if (chapters.length === 0 && bookId) {
+          chapters.push({
+            id: bookId,
+            number: "",
+            title: bookTitle,
+            section: "",
+            href: origin + bookPath,
+            pages: "",
+            pdfUrl: `${origin}/stable/pdf/${bookId}.pdf`,
+            accessible: bookIsOpen ? true : access.isAuthorized,
+            access: access.isAuthorized === false && !bookIsOpen ? "no access" : "",
+          });
+        }
+
+        if (chapters.length === 0) return null;
+
+        return {
+          provider: "jstor",
+          bookId,
+          bookTitle,
+          baseUrl: origin,
+          chapters,
+          // Same reasoning as CUP: run every fetch inside the user's authenticated tab so
+          // first-party cookies (SameSite) and JSTOR's bot-detection context ride along.
+          fetchMethod: "page",
+          // JSTOR rate-limits and serves captchas aggressively: never go faster than
+          // 3s between requests (plus jitter), back off on 403 too, and abort the whole
+          // job on a terms-and-conditions or challenge page instead of hammering on.
+          minDelayMs: 3000,
+          retryStatuses: [403, 429, 502, 503, 504],
+          retryBaseDelayMs: 5000,
+          abortOnBlock: true,
+        };
+      },
+      _clean(s) {
+        return (s || "").replace(/\s+/g, " ").trim();
+      },
+      // Reduce any href (absolute, relative, or rewritten by a proxy) to its path so we
+      // can re-anchor it on the current origin.
+      _samePath(href) {
+        try {
+          return new URL(href, window.location.href).pathname;
+        } catch (_e) {
+          return "";
+        }
+      },
+      _isJstorSite() {
+        if (/(^|\.)jstor\.org$/i.test(window.location.hostname)) return true;
+        const site = document.querySelector("meta[property='og:site_name']");
+        return !!site && /^JSTOR$/i.test((site.getAttribute("content") || "").trim());
+      },
+      _bookJsonLd() {
+        const scripts = document.querySelectorAll("script[type='application/ld+json']");
+        for (const s of scripts) {
+          let data;
+          try {
+            data = JSON.parse(s.textContent);
+          } catch (_e) {
+            continue;
+          }
+          const nodes = Array.isArray(data) ? data : data["@graph"] || [data];
+          for (const n of nodes) {
+            const t = n && n["@type"];
+            if (t === "Book" || (Array.isArray(t) && t.includes("Book"))) return n;
+          }
+        }
+        return null;
+      },
+      _ldDoi(node) {
+        const ids = [].concat((node && node.identifier) || []);
+        for (const id of ids) {
+          if (id && /doi/i.test(id.propertyID || "") && id.value) return String(id.value).trim();
+        }
+        const url = node && (node.url || node.mainEntityOfPage);
+        const m = typeof url === "string" && url.match(/\/stable\/(10\.\d+\/.+)$/);
+        return m ? m[1] : "";
+      },
+      // SvelteKit's hydration payload (an inline <script>, JS-literal not JSON) carries
+      // per-chapter access info that the rendered TOC doesn't expose as attributes.
+      _stateText() {
+        for (const s of document.querySelectorAll("script:not([src])")) {
+          const t = s.textContent || "";
+          if (/tocEntries|childDoiAccessExperienceMap/.test(t)) return t;
+        }
+        return "";
+      },
+      _accessState() {
+        const state = this._stateText();
+        const out = { map: {}, openDois: new Set(), freeDois: new Set(), isAuthorized: undefined };
+        const objRe = /["']?childDoiAccessExperienceMap["']?\s*:\s*(\{[^{}]*\})/g;
+        let m;
+        while ((m = objRe.exec(state))) {
+          try {
+            Object.assign(out.map, JSON.parse(m[1]));
+          } catch (_e) {
+            /* ignore malformed */
+          }
+        }
+        const arr = (key) => {
+          const mm = state.match(new RegExp(`["']?${key}["']?\\s*:\\s*(\\[[^\\[\\]]*\\])`));
+          try {
+            return mm ? JSON.parse(mm[1]) : [];
+          } catch (_e) {
+            return [];
+          }
+        };
+        arr("openAccessDois").forEach((d) => out.openDois.add(d));
+        arr("freeDois").forEach((d) => out.freeDois.add(d));
+        const auth = state.match(/["']?isAuthorized["']?\s*:\s*(true|false|!0|!1)/);
+        if (auth) out.isAuthorized = auth[1] === "true" || auth[1] === "!0";
+        return out;
+      },
+      // accessible: true (include, checked), false (shown unchecked with a note),
+      // undefined (no signal either way — include and let the download step decide).
+      _chapterAccess(doi, access, bookIsOpen) {
+        if (bookIsOpen || access.openDois.has(doi)) return { accessible: true, label: "open access" };
+        if (access.freeDois.has(doi)) return { accessible: true, label: "free" };
+        const v = access.map[doi];
+        if (typeof v === "string") {
+          if (/full|open|free/i.test(v)) return { accessible: true, label: "" };
+          return { accessible: false, label: v.replace(/_/g, " ") };
+        }
+        if (access.isAuthorized === false) return { accessible: false, label: "no access" };
+        return { accessible: undefined, label: "" };
+      },
+      _pdfUrlFromDoi(doi) {
+        // JSTOR-owned DOIs (10.2307/...) drop the prefix in stable URLs; publisher DOIs keep it.
+        const id = doi.replace(/^10\.2307\//, "");
+        return `${window.location.origin}/stable/pdf/${id}.pdf`;
+      },
+      // Part/section headings: every ancestor .toc-content-wrapper whose direct child is a
+      // .toc-header heading contributes one level (outermost first).
+      _sectionFor(item) {
+        const names = [];
+        let el = item.parentElement;
+        while (el) {
+          if (el.classList && el.classList.contains("toc-content-wrapper")) {
+            const h = el.querySelector(":scope > .toc-header");
+            if (h && !h.contains(item)) names.unshift(this._clean(h.textContent));
+          }
+          el = el.parentElement;
+        }
+        return names.filter(Boolean).join(" / ");
       },
     },
   ];

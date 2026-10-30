@@ -48,17 +48,24 @@ function sleepWithJitter(ms) {
 // CDN / origin codes that indicate "try again later", not a permanent failure.
 const RETRIABLE_STATUSES = new Set([429, 502, 503, 504]);
 
-function isRetriable(result) {
-  return !!(result && result.status && RETRIABLE_STATUSES.has(result.status));
+// `statuses` lets a provider widen the set (JSTOR also backs off on 403).
+function isRetriable(result, statuses = RETRIABLE_STATUSES) {
+  return !!(result && result.status && statuses.has(result.status));
 }
 
 // Retry an async producer up to N times on retriable HTTP statuses, with
 // exponential backoff (2s, 4s, …). Logs retry intent into the job feed.
-async function withRetry(job, fn, { attempts = 3, baseDelayMs = 2000 } = {}) {
+// `stopIf(result)` short-circuits retries (e.g. a captcha page: retrying makes it worse).
+async function withRetry(
+  job,
+  fn,
+  { attempts = 3, baseDelayMs = 2000, statuses = RETRIABLE_STATUSES, stopIf = null } = {}
+) {
   let result;
   for (let i = 0; i < attempts; i++) {
     result = await fn();
-    if (!isRetriable(result)) return result;
+    if (stopIf && stopIf(result)) return result;
+    if (!isRetriable(result, statuses)) return result;
     if (i < attempts - 1) {
       const wait = baseDelayMs * Math.pow(2, i);
       jobLog(
@@ -186,12 +193,43 @@ async function _pageFetchPdfUrl(chapterUrl, primarySelector, fallbackSelector, m
 // ride along (the extension context cannot replicate this).
 
 async function _pageFetchBinary(url, expectedTypeSubstrings) {
+  // When the server answers with an HTML page instead of the file, summarise it so the
+  // service worker can tell a terms-acceptance or bot-challenge page from a paywall.
+  // Must stay self-contained: this whole function is serialised into the page.
+  function htmlHints(text) {
+    const sample = (text || "").slice(0, 200000);
+    const title = ((sample.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return {
+      title,
+      termsForm: /(action|href)=["'][^"']*\/tc\/(accept|verify)|acceptTC=/i.test(sample),
+      challenge:
+        /cf-chl-|challenge-platform|g-recaptcha|h-captcha|hcaptcha|px-captcha|captcha-delivery|unusual traffic/i.test(
+          sample
+        ),
+    };
+  }
+  async function readHints(resp) {
+    try {
+      return htmlHints(await resp.text());
+    } catch (_e) {
+      return {};
+    }
+  }
   try {
     const resp = await fetch(url, { credentials: "same-origin" });
     // AWS WAF (used by e.g. De Gruyter Brill) flags challenge/CAPTCHA answers here.
     const wafAction = resp.headers.get("x-amzn-waf-action") || "";
     if (!resp.ok) {
-      return { error: `HTTP ${resp.status}`, status: resp.status, finalUrl: resp.url, wafAction };
+      return {
+        error: `HTTP ${resp.status}`,
+        status: resp.status,
+        finalUrl: resp.url,
+        wafAction,
+        cfMitigated: resp.headers.get("cf-mitigated") || "",
+        hints: await readHints(resp),
+      };
     }
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
     if (Array.isArray(expectedTypeSubstrings) && expectedTypeSubstrings.length > 0) {
@@ -203,6 +241,7 @@ async function _pageFetchBinary(url, expectedTypeSubstrings) {
           contentType: ct,
           finalUrl: resp.url,
           wafAction,
+          hints: ct.includes("html") ? await readHints(resp) : undefined,
         };
       }
     }
@@ -225,6 +264,12 @@ async function _pageFetchBinary(url, expectedTypeSubstrings) {
           const c = bytes[i];
           preview += c >= 32 && c < 127 ? String.fromCharCode(c) : ".";
         }
+        let hints;
+        try {
+          hints = htmlHints(new TextDecoder().decode(bytes.subarray(0, 200000)));
+        } catch (_e) {
+          /* not decodable */
+        }
         return {
           error: `Not a PDF (starts with ${JSON.stringify(head)}, size=${bytes.length})`,
           status: resp.status,
@@ -232,6 +277,7 @@ async function _pageFetchBinary(url, expectedTypeSubstrings) {
           finalUrl: resp.url,
           wafAction,
           preview,
+          hints,
         };
       }
     }
@@ -320,6 +366,54 @@ async function downloadPdfViaTab(pdfUrl) {
   });
 }
 
+// --- Block-page detection (providers opt in with abortOnBlock) ---
+// Classifies a failed _pageFetchBinary result. Returns null for an ordinary
+// per-chapter failure (e.g. no access to that chapter), or { kind, message } when every
+// further request would fail the same way and the job should stop.
+
+function detectBlockPage(result) {
+  if (!result || result.base64) return null;
+  const hints = result.hints || {};
+  const title = hints.title || "";
+  const finalUrl = result.finalUrl || "";
+  if (
+    hints.termsForm ||
+    /\/tc\/(accept|verify)\b/i.test(finalUrl) ||
+    /terms (and|&) conditions/i.test(title)
+  ) {
+    return {
+      kind: "terms",
+      message:
+        "JSTOR wants you to accept its Terms and Conditions before it serves PDFs. " +
+        "In the book tab, click Download on any one chapter, accept the terms, close " +
+        "the PDF, then start the merge again.",
+    };
+  }
+  if (
+    hints.challenge ||
+    result.cfMitigated === "challenge" ||
+    /just a moment|attention required|access check|captcha|are you a robot|verify you are human|security check/i.test(
+      title
+    )
+  ) {
+    return {
+      kind: "challenge",
+      message:
+        "The site showed a captcha / bot check instead of the PDF, so the job was stopped. " +
+        "Reload the book page, solve the check if one appears, wait a few minutes, then " +
+        'retry (fewer chapters per job or a higher "Request delay" in Settings also help).',
+    };
+  }
+  return null;
+}
+
+// Errors marked fatal escape the per-chapter catch and abort the whole job.
+function fatalError(message) {
+  const err = new Error(message);
+  err.fatal = true;
+  return err;
+}
+
 // --- Per-chapter scrape + download path ---
 
 async function fetchPerChapter(job, chapters, settings, providerInfo) {
@@ -329,6 +423,19 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
   // CUP serves PDFs with SameSite-restricted cookies, so we must fetch from the page
   // context. OUP works fine with the hidden-tab method, so keep that as default.
   const usePageFetch = providerInfo?.fetchMethod === "page";
+  // Optional provider pacing / blocking policy (JSTOR). Defaults keep OUP/CUP unchanged.
+  const userDelayMs = settings.delayMs || 500;
+  const delayMs = Math.max(userDelayMs, providerInfo?.minDelayMs || 0);
+  const abortOnBlock = !!providerInfo?.abortOnBlock;
+  const retryOpts = {};
+  if (Array.isArray(providerInfo?.retryStatuses)) {
+    retryOpts.statuses = new Set(providerInfo.retryStatuses);
+  }
+  if (providerInfo?.retryBaseDelayMs) retryOpts.baseDelayMs = providerInfo.retryBaseDelayMs;
+  if (abortOnBlock) retryOpts.stopIf = (r) => !!detectBlockPage(r);
+  if (delayMs !== userDelayMs) {
+    jobLog(job, `Pacing: ~${delayMs} ms between requests (publisher minimum)`, "");
+  }
 
   // Step 1: Find PDF URLs
   const pdfEntries = [];
@@ -370,7 +477,7 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
     } else {
       jobLog(job, `No PDF: ${label} (${result?.error || "?"})`, "log-warn");
     }
-    if (i < chapters.length - 1) await sleepWithJitter(settings.delayMs || 500);
+    if (i < chapters.length - 1) await sleepWithJitter(delayMs);
   }
 
   if (pdfEntries.length === 0) {
@@ -385,20 +492,37 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
   const pdfBase64List = [];
   let failedNoAccess = 0;
   let botBlocked = "";
+  let htmlFailures = 0;
   for (let i = 0; i < pdfEntries.length; i++) {
     const { url, label } = pdfEntries[i];
     jobProgress(job, `Downloading ${i + 1}/${pdfEntries.length}: ${label}`);
 
     try {
       const result = usePageFetch
-        ? await withRetry(job, () =>
-            runInMainWorld(job.tabId, _pageFetchBinary, [url, ["pdf"]])
+        ? await withRetry(
+            job,
+            () => runInMainWorld(job.tabId, _pageFetchBinary, [url, ["pdf"]]),
+            retryOpts
           )
         : await downloadPdfViaTab(url);
-      if (isRetriable(result)) {
-        throw new Error(
-          `Rate-limited by server (HTTP ${result.status}). Try again in a few minutes, or bump "Request delay" in Settings.`
-        );
+      const block = abortOnBlock ? detectBlockPage(result) : null;
+      if (block) {
+        jobLog(job, `Stopped at: ${label}`, "log-error");
+        if (result?.finalUrl && result.finalUrl !== url) {
+          jobLog(job, `  redirected to: ${result.finalUrl}`, "log-warn");
+        }
+        throw fatalError(block.message);
+      }
+      if (isRetriable(result, retryOpts.statuses)) {
+        const msg =
+          result.status === 403
+            ? `Server refused the request (HTTP 403) at "${label}" even after backing off. ` +
+              "This is usually bot protection: wait a few minutes, reload the book page " +
+              "(solve any check it shows), then retry. If it keeps failing on this one " +
+              "chapter, your access may not cover it; deselect it."
+            : `Rate-limited by server (HTTP ${result.status}). Try again in a few minutes, or bump "Request delay" in Settings.`;
+        // abortOnBlock providers stop the job here; others keep the pre-existing behaviour.
+        throw abortOnBlock ? fatalError(msg) : new Error(msg);
       }
       if (result?.base64) {
         pdfBase64List.push(result.base64);
@@ -424,6 +548,15 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
             `Failed: ${label} — no access (CUP redirected to abstract page)`,
             "log-error"
           );
+        } else if (abortOnBlock && result?.hints?.title) {
+          // An HTML page instead of the PDF that is not a terms/captcha page: almost
+          // always "your access doesn't cover this chapter".
+          jobLog(
+            job,
+            `Failed: ${label} — got the web page "${result.hints.title}" instead of a PDF ` +
+              "(probably no access to this chapter)",
+            "log-error"
+          );
         } else {
           jobLog(job, `Failed: ${label} (${result?.error || "no data"})`, "log-error");
         }
@@ -433,11 +566,25 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
         if (result?.preview) {
           jobLog(job, `  body starts: ${result.preview.slice(0, 120)}`, "log-warn");
         }
+        // If the very first chapters all come back as web pages, something session-wide
+        // is wrong (unrecognised terms page, expired login): stop instead of hammering on.
+        if (abortOnBlock && result?.hints) {
+          htmlFailures++;
+          if (pdfBase64List.length === 0 && htmlFailures >= 2) {
+            throw fatalError(
+              "JSTOR returned web pages instead of PDFs for the first chapters. Most often " +
+                "it wants you to accept its Terms and Conditions: click Download on one " +
+                "chapter in the book tab, accept, then retry. Otherwise check that you are " +
+                "still signed in and that your access covers the selected chapters."
+            );
+          }
+        }
       }
     } catch (err) {
+      if (err.fatal) throw err;
       jobLog(job, `Failed: ${label} (${err.message})`, "log-error");
     }
-    if (i < pdfEntries.length - 1) await sleepWithJitter(settings.delayMs || 500);
+    if (i < pdfEntries.length - 1) await sleepWithJitter(delayMs);
   }
 
   if (botBlocked) {

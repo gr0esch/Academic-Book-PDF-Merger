@@ -111,8 +111,10 @@
 
       const cb = document.createElement("input");
       cb.type = "checkbox";
-      // Chapters the page marks as not licensed start unchecked.
-      cb.checked = !ch.noAccess;
+      // Chapters known (noAccess) or likely (accessible === false) to be unlicensed
+      // start unchecked.
+      const lacksAccess = ch.noAccess || ch.accessible === false;
+      cb.checked = !lacksAccess;
       cb.dataset.index = idx;
       cb.addEventListener("change", updateCount);
 
@@ -128,10 +130,11 @@
       item.appendChild(cb);
       item.appendChild(num);
       item.appendChild(title);
-      if (ch.noAccess) {
+      const accessLabel = ch.access || (ch.noAccess ? "no access" : "");
+      if (accessLabel) {
         const tag = document.createElement("span");
-        tag.className = "chapter-noaccess";
-        tag.textContent = "no access";
+        tag.className = "chapter-access" + (lacksAccess ? " no-access" : "");
+        tag.textContent = accessLabel;
         item.appendChild(tag);
       }
       $chapters.appendChild(item);
@@ -196,6 +199,10 @@
         wholeBookPdfUrl: bookData.wholeBookPdfUrl,
         totalChapters: bookData.totalChapters,
         noAccessOnHtml: bookData.noAccessOnHtml,
+        minDelayMs: bookData.minDelayMs,
+        retryStatuses: bookData.retryStatuses,
+        retryBaseDelayMs: bookData.retryBaseDelayMs,
+        abortOnBlock: bookData.abortOnBlock,
       },
     });
   });
