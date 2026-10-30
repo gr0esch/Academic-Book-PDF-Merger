@@ -80,11 +80,11 @@ Right-click the extension icon and select **Options**, or go to `chrome://extens
 1. **Content script** detects the publisher and scrapes the chapter list from the book's table of contents page
 2. **Background service worker** orchestrates the merge job:
    - Finds each chapter's PDF URL: taken straight from the table of contents where the publisher lists it (De Gruyter Brill, JSTOR), otherwise by fetching the chapter page (in the page's context, with your session cookies)
-   - Downloads each PDF either in a hidden background tab (OUP) or with a fetch from your own book tab (CUP, De Gruyter Brill, JSTOR), so your session cookies and any bot-protection token are sent
+   - Downloads each PDF either with a fetch from your own book tab (CUP, De Gruyter Brill, JSTOR), so your session cookies and any bot-protection token are sent, or, for OUP, with a direct fetch when your session allows it and a hidden background tab otherwise; OUP works on up to 3 chapters at a time
    - Checks that every download really is a PDF (`%PDF-` header) and reports paywall, terms-acceptance and captcha pages clearly
    - Uses a single bulk download instead when the publisher offers one (CUP chapter ZIP; De Gruyter Brill full-book PDF when all chapters are selected)
    - Merges all PDFs in order using pdf-lib
-   - Triggers the final download via the Chrome downloads API
+   - Triggers the final download via the Chrome downloads API (the file is handed to the offscreen document in slices, so large books are not limited by Chrome's 64 MiB message cap)
 
 ## Architecture
 

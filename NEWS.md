@@ -26,6 +26,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (display label in the popup); optional pacing fields `minDelayMs`, `retryStatuses`,
   `retryBaseDelayMs`; and `abortOnBlock`. Other providers don't set them and behave as before.
 
+### Changed
+
+- **OUP downloads are much faster**
+  ([#8](https://github.com/gr0esch/Academic-Book-PDF-Merger/issues/8)).
+  - Up to 3 chapters are looked up and downloaded at a time (new optional provider field
+    `concurrency`, capped at 4; providers that don't set it stay sequential). Merge order
+    is unchanged.
+  - The first chapter is tried with a plain fetch from the service worker
+    (`directFetch: true`). If that returns a PDF, the whole job skips the hidden tabs;
+    otherwise it falls back to hidden tabs as before.
+  - Hidden tabs no longer wait a fixed 1 s and re-download the PDF. The tab is read
+    ~150 ms after loading, from the HTTP cache (`cache: "force-cache"`), with one retry at
+    the old 1 s mark. Non-PDF responses in a tab are now reported as a failed download
+    instead of being skipped silently during the merge.
+- Downloaded files are kept as bytes end to end. They are no longer base64-encoded and
+  decoded again for every chapter, ZIP entry and merge step, which cuts memory use for
+  large books.
+
+### Fixed
+
+- **Books whose merged PDF is larger than ~48 MB failed at the save step**
+  ([#8](https://github.com/gr0esch/Academic-Book-PDF-Merger/issues/8)). The whole file
+  was sent to the offscreen document as one base64 message, and extension messages are
+  capped at 64 MiB. It is now sent in 8 MiB slices and reassembled into one Blob there.
+  The job also waits for Chrome to finish writing the download before it releases the
+  blob.
+
 ### Manifest
 
 - Added `*://*.jstor.org/*` to `host_permissions`.
