@@ -106,6 +106,55 @@ function toBase64(bytes) {
   return btoa(binary);
 }
 
+function fromBase64(b64) {
+  if (typeof Uint8Array.fromBase64 === "function") return Uint8Array.fromBase64(b64);
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+// Files cross the executeScript boundary as base64; turn them back into bytes once,
+// on arrival, so the rest of the pipeline only ever holds Uint8Arrays.
+function decodeResult(result) {
+  if (result && result.base64) {
+    result.bytes = fromBase64(result.base64);
+    delete result.base64;
+  }
+  return result;
+}
+
+function isPdf(bytes) {
+  return (
+    bytes.length >= 5 &&
+    String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]) === "%PDF-"
+  );
+}
+
+// Upper bound for a provider's `concurrency` field.
+const MAX_CONCURRENCY = 4;
+
+// Runs worker(i) for i = 0..count-1, at most `size` at a time, starting in index order.
+// The first error stops new items from starting and is rethrown once the in-flight
+// ones finish; `shouldStop()` stops new items without an error. size = 1 behaves
+// exactly like a plain for-loop.
+async function runPool(count, size, worker, shouldStop = () => false) {
+  let next = 0;
+  let failure = null;
+  async function lane() {
+    while (!failure && !shouldStop() && next < count) {
+      const i = next++;
+      try {
+        await worker(i);
+      } catch (err) {
+        failure = failure || err;
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(size, count) }, lane));
+  if (failure) throw failure;
+}
+
 async function runInMainWorld(tabId, func, args) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
@@ -131,20 +180,65 @@ async function ensureOffscreen() {
   });
 }
 
-function createBlobUrlViaOffscreen(base64Data) {
+function sendToOffscreen(message) {
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
-      { action: "createBlobUrl", base64: base64Data },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-        } else if (response && response.url) {
-          resolve(response.url);
-        } else {
-          reject(new Error(response?.error || "No blob URL returned"));
-        }
+    chrome.runtime.sendMessage(message, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else if (!response || response.error) {
+        reject(new Error(response?.error || `No response to ${message.action}`));
+      } else {
+        resolve(response);
       }
-    );
+    });
+  });
+}
+
+// Extension messages are JSON and capped at 64 MiB, and base64 adds a third, so a
+// merged PDF above ~48 MiB cannot be sent in one message. Send it in slices instead;
+// the offscreen document reassembles them into a single Blob.
+const BLOB_CHUNK_BYTES = 8 * 1024 * 1024;
+
+async function createBlobUrlViaOffscreen(bytes) {
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await sendToOffscreen({ action: "blobStart", id });
+  for (let off = 0; off < bytes.length; off += BLOB_CHUNK_BYTES) {
+    const base64 = toBase64(bytes.subarray(off, off + BLOB_CHUNK_BYTES));
+    await sendToOffscreen({ action: "blobChunk", id, base64 });
+  }
+  const { url } = await sendToOffscreen({ action: "blobFinish", id });
+  return url;
+}
+
+function revokeBlobUrl(url) {
+  sendToOffscreen({ action: "blobRevoke", url }).catch(() => {});
+}
+
+// Resolves with the final download state ("complete" or "interrupted") and error, so
+// the blob (and the offscreen document holding it) stays alive until Chrome is done.
+function waitForDownload(downloadId, timeoutMs = 10 * 60 * 1000) {
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = (state, error) => {
+      if (finished) return;
+      finished = true;
+      chrome.downloads.onChanged.removeListener(onChanged);
+      clearTimeout(timer);
+      resolve({ state, error });
+    };
+    function onChanged(delta) {
+      if (delta.id !== downloadId || !delta.state) return;
+      if (delta.state.current !== "in_progress") {
+        finish(delta.state.current, delta.error?.current);
+      }
+    }
+    chrome.downloads.onChanged.addListener(onChanged);
+    const timer = setTimeout(() => finish("timeout"), timeoutMs);
+    // It may already be finished (small files) before the listener was attached.
+    chrome.downloads.search({ id: downloadId }, (items) => {
+      const item = items && items[0];
+      if (item && item.state !== "in_progress") finish(item.state, item.error);
+    });
   });
 }
 
@@ -319,51 +413,112 @@ async function downloadPdfViaTab(pdfUrl) {
           chrome.tabs.onUpdated.removeListener(onUpdated);
           clearTimeout(timeout);
 
-          setTimeout(async () => {
-            try {
-              const results = await chrome.scripting.executeScript({
-                target: { tabId },
-                world: "MAIN",
-                func: async () => {
-                  try {
-                    const resp = await fetch(window.location.href, {
-                      credentials: "same-origin",
-                    });
-                    if (!resp.ok) return { error: `HTTP ${resp.status}` };
-                    const buffer = await resp.arrayBuffer();
-                    const bytes = new Uint8Array(buffer);
-                    let binary = "";
-                    const cs = 32768;
-                    for (let i = 0; i < bytes.length; i += cs) {
-                      binary += String.fromCharCode.apply(
-                        null,
-                        bytes.subarray(i, i + cs)
-                      );
-                    }
-                    return { base64: btoa(binary), size: bytes.length };
-                  } catch (e) {
-                    return { error: `In-tab fetch: ${e.message}` };
-                  }
-                },
-              });
+          readPdfFromTab(tabId).then(
+            (result) => {
               chrome.tabs.remove(tabId).catch(() => {});
               resolved = true;
-              if (results?.[0]?.result) {
-                resolve(results[0].result);
-              } else {
-                reject(new Error("No result from tab script"));
-              }
-            } catch (err) {
+              resolve(result);
+            },
+            (err) => {
               chrome.tabs.remove(tabId).catch(() => {});
               resolved = true;
               reject(err);
             }
-          }, 1000);
+          );
         }
         chrome.tabs.onUpdated.addListener(onUpdated);
       }
     );
   });
+}
+
+// Read the PDF the tab just loaded. The first try comes shortly after "complete"; if
+// the script can't run yet or the tab isn't showing the PDF yet (late redirect), one
+// more try follows at the 1 s mark where the old fixed wait used to be.
+async function readPdfFromTab(tabId) {
+  let last = null;
+  for (const waitMs of [150, 850]) {
+    await sleep(waitMs);
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: _tabFetchOwnPdf,
+      });
+      last = results?.[0]?.result || { error: "No result from tab script" };
+    } catch (err) {
+      last = { error: err.message };
+    }
+    if (last.base64) return decodeResult(last);
+  }
+  return last;
+}
+
+// Injected into the hidden tab: re-read the URL it shows. Chrome's PDF viewer has just
+// downloaded it, so `force-cache` usually answers from the HTTP cache instead of a
+// second network download.
+async function _tabFetchOwnPdf() {
+  try {
+    const resp = await fetch(window.location.href, {
+      credentials: "same-origin",
+      cache: "force-cache",
+    });
+    if (!resp.ok) return { error: `HTTP ${resp.status}` };
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    const head = String.fromCharCode(...bytes.subarray(0, 5));
+    if (head !== "%PDF-") {
+      return {
+        error: `Not a PDF (starts with ${JSON.stringify(head)}, size=${bytes.length})`,
+        finalUrl: window.location.href,
+      };
+    }
+    let binary = "";
+    const cs = 32768;
+    for (let i = 0; i < bytes.length; i += cs) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + cs));
+    }
+    return { base64: btoa(binary), size: bytes.length };
+  } catch (e) {
+    return { error: `In-tab fetch: ${e.message}` };
+  }
+}
+
+// --- Direct download from the service worker (providers opt in with directFetch) ---
+// Host permissions cover the publisher and its CDN, so there is no CORS barrier, and
+// IP-range access works as-is. Whether the user's session cookies ride along depends
+// on the site, so the job's first answer decides: a PDF switches the job to direct
+// downloads, anything else switches it back to hidden tabs for good.
+
+async function fetchBinaryDirect(url) {
+  try {
+    const resp = await fetch(url, { credentials: "include" });
+    if (!resp.ok) return { error: `HTTP ${resp.status}` };
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    if (!isPdf(bytes)) {
+      return { error: `not a PDF (${resp.headers.get("content-type") || "unknown type"})` };
+    }
+    return { bytes, size: bytes.length };
+  } catch (e) {
+    return { error: `${e.name}: ${e.message}` };
+  }
+}
+
+async function downloadDirectOrViaTab(job, url, direct) {
+  if (direct.mode !== "off") {
+    const result = await fetchBinaryDirect(url);
+    if (result.bytes) {
+      if (direct.mode === "probe") {
+        direct.mode = "on";
+        jobLog(job, "Direct download works for this session — no background tabs needed", "log-ok");
+      }
+      return result;
+    }
+    if (direct.mode === "probe") {
+      direct.mode = "off";
+      jobLog(job, `Direct download unavailable (${result.error}) — using background tabs`, "");
+    }
+  }
+  return downloadPdfViaTab(url);
 }
 
 // --- Block-page detection (providers opt in with abortOnBlock) ---
@@ -372,7 +527,7 @@ async function downloadPdfViaTab(pdfUrl) {
 // further request would fail the same way and the job should stop.
 
 function detectBlockPage(result) {
-  if (!result || result.base64) return null;
+  if (!result || result.bytes) return null;
   const hints = result.hints || {};
   const title = hints.title || "";
   const finalUrl = result.finalUrl || "";
@@ -436,11 +591,16 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
   if (delayMs !== userDelayMs) {
     jobLog(job, `Pacing: ~${delayMs} ms between requests (publisher minimum)`, "");
   }
+  // Chapters in flight at once. Opt-in per provider (OUP); everyone else stays sequential.
+  const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, providerInfo?.concurrency || 1));
+  if (concurrency > 1) jobLog(job, `Working on up to ${concurrency} chapters at a time`, "");
+  // Hidden-tab providers may first try a direct download (see downloadDirectOrViaTab).
+  const direct = { mode: !usePageFetch && providerInfo?.directFetch ? "probe" : "off" };
 
-  // Step 1: Find PDF URLs
-  const pdfEntries = [];
+  // Step 1: Find PDF URLs (results kept by index, so TOC order survives concurrency)
+  const found = new Array(chapters.length);
   let skippedNoAccess = 0;
-  for (let i = 0; i < chapters.length; i++) {
+  await runPool(chapters.length, concurrency, async (i) => {
     const ch = chapters[i];
     const label = ch.number ? `Ch. ${ch.number}: ${ch.title}` : ch.title;
     jobProgress(job, `Finding PDF ${i + 1}/${chapters.length}: ${label}`);
@@ -449,13 +609,13 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
     if (ch.noAccess) {
       skippedNoAccess++;
       jobLog(job, `No access: ${label} — not licensed for your account (skipped)`, "log-warn");
-      continue;
+      return;
     }
     // Provider already scraped the PDF URL from the TOC: no chapter-page fetch.
     if (ch.pdfUrl) {
-      pdfEntries.push({ url: ch.pdfUrl, label });
+      found[i] = { url: ch.pdfUrl, label };
       jobLog(job, `Found: ${label}`, "log-ok");
-      continue;
+      return;
     }
 
     const result = await withRetry(job, () =>
@@ -472,13 +632,14 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
       );
     }
     if (result?.url) {
-      pdfEntries.push({ url: result.url, label });
+      found[i] = { url: result.url, label };
       jobLog(job, `Found: ${label}`, "log-ok");
     } else {
       jobLog(job, `No PDF: ${label} (${result?.error || "?"})`, "log-warn");
     }
     if (i < chapters.length - 1) await sleepWithJitter(delayMs);
-  }
+  });
+  const pdfEntries = found.filter(Boolean);
 
   if (pdfEntries.length === 0) {
     throw new Error(
@@ -488,23 +649,26 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
     );
   }
 
-  // Step 2: Download PDFs via hidden tabs
-  const pdfBase64List = [];
+  // Step 2: Download PDFs (in-tab fetch, direct fetch, or hidden tabs)
+  const pdfList = new Array(pdfEntries.length);
+  let downloadedCount = 0;
   let failedNoAccess = 0;
   let botBlocked = "";
   let htmlFailures = 0;
-  for (let i = 0; i < pdfEntries.length; i++) {
+  await runPool(pdfEntries.length, concurrency, async (i) => {
     const { url, label } = pdfEntries[i];
     jobProgress(job, `Downloading ${i + 1}/${pdfEntries.length}: ${label}`);
 
     try {
       const result = usePageFetch
-        ? await withRetry(
-            job,
-            () => runInMainWorld(job.tabId, _pageFetchBinary, [url, ["pdf"]]),
-            retryOpts
+        ? decodeResult(
+            await withRetry(
+              job,
+              () => runInMainWorld(job.tabId, _pageFetchBinary, [url, ["pdf"]]),
+              retryOpts
+            )
           )
-        : await downloadPdfViaTab(url);
+        : await downloadDirectOrViaTab(job, url, direct);
       const block = abortOnBlock ? detectBlockPage(result) : null;
       if (block) {
         jobLog(job, `Stopped at: ${label}`, "log-error");
@@ -524,8 +688,9 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
         // abortOnBlock providers stop the job here; others keep the pre-existing behaviour.
         throw abortOnBlock ? fatalError(msg) : new Error(msg);
       }
-      if (result?.base64) {
-        pdfBase64List.push(result.base64);
+      if (result?.bytes) {
+        pdfList[i] = result.bytes;
+        downloadedCount++;
         jobLog(job, `Downloaded: ${label} (${formatBytes(result.size)})`, "log-ok");
       } else {
         const looksLikePaywall =
@@ -534,7 +699,7 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
           // Stop instead of hitting the remaining chapters while challenged.
           botBlocked = result.wafAction;
           jobLog(job, `Failed: ${label} — ${BOT_CHECK_HINT} (WAF: ${result.wafAction})`, "log-error");
-          break;
+          return;
         } else if (providerInfo?.noAccessOnHtml && looksLikeNoAccess(result)) {
           failedNoAccess++;
           jobLog(
@@ -570,7 +735,7 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
         // is wrong (unrecognised terms page, expired login): stop instead of hammering on.
         if (abortOnBlock && result?.hints) {
           htmlFailures++;
-          if (pdfBase64List.length === 0 && htmlFailures >= 2) {
+          if (downloadedCount === 0 && htmlFailures >= 2) {
             throw fatalError(
               "JSTOR returned web pages instead of PDFs for the first chapters. Most often " +
                 "it wants you to accept its Terms and Conditions: click Download on one " +
@@ -585,18 +750,18 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
       jobLog(job, `Failed: ${label} (${err.message})`, "log-error");
     }
     if (i < pdfEntries.length - 1) await sleepWithJitter(delayMs);
-  }
+  }, () => !!botBlocked);
 
   if (botBlocked) {
     throw new Error(`Stopped: ${BOT_CHECK_HINT} (WAF: ${botBlocked}).`);
   }
-  if (pdfBase64List.length === 0 && failedNoAccess > 0) {
+  if (downloadedCount === 0 && failedNoAccess > 0) {
     throw new Error(
       "No access: the site did not return any PDFs for your current session. Sign in on the book page (institution or personal account), reload it, and try again."
     );
   }
 
-  return pdfBase64List;
+  return pdfList.filter(Boolean);
 }
 
 // --- Whole-book path: one GET for the publisher's full-book PDF ---
@@ -606,20 +771,20 @@ async function fetchWholeBook(job, providerInfo) {
   jobProgress(job, "Fetching whole-book PDF...");
   jobLog(job, `Book offers a full-book PDF — requesting it from ${new URL(url).host}...`, "");
 
-  const result = await withRetry(job, () =>
-    runInMainWorld(job.tabId, _pageFetchBinary, [url, ["pdf"]])
+  const result = decodeResult(
+    await withRetry(job, () => runInMainWorld(job.tabId, _pageFetchBinary, [url, ["pdf"]]))
   );
   if (!result) throw new Error("No response from page fetch");
   if (isRetriable(result)) throw new Error(`HTTP ${result.status} (rate-limited)`);
   if (result.wafAction) throw new Error(`${BOT_CHECK_HINT} (WAF: ${result.wafAction})`);
-  if (!result.base64) {
+  if (!result.bytes) {
     if (providerInfo.noAccessOnHtml && looksLikeNoAccess(result)) {
       throw new Error("no access to the full-book PDF");
     }
     throw new Error(result.error || "no data");
   }
   jobLog(job, `Downloaded full book: ${formatBytes(result.size)}`, "log-ok");
-  return result.base64;
+  return result.bytes;
 }
 
 // --- CUP ZIP path: one GET, unzip in service worker ---
@@ -633,8 +798,8 @@ async function fetchZipBundle(job, chapters, providerInfo) {
   jobLog(job, `Requesting ZIP from ${new URL(zipUrl).host}...`, "");
 
   // Run inside the user's authenticated tab so SameSite cookies are sent.
-  const result = await withRetry(job, () =>
-    runInMainWorld(job.tabId, _pageFetchBinary, [zipUrl, ["zip"]])
+  const result = decodeResult(
+    await withRetry(job, () => runInMainWorld(job.tabId, _pageFetchBinary, [zipUrl, ["zip"]]))
   );
   if (!result) throw new Error("No response from page fetch");
   if (isRetriable(result)) {
@@ -643,11 +808,9 @@ async function fetchZipBundle(job, chapters, providerInfo) {
     );
   }
   if (result.error) throw new Error(result.error);
-  if (!result.base64) throw new Error("ZIP response had no body");
+  if (!result.bytes) throw new Error("ZIP response had no body");
 
-  const binary = atob(result.base64);
-  const zipBytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) zipBytes[i] = binary.charCodeAt(i);
+  const zipBytes = result.bytes;
   jobLog(job, `Downloaded ZIP: ${formatBytes(zipBytes.length)}`, "log-ok");
 
   jobProgress(job, "Extracting ZIP...");
@@ -662,24 +825,24 @@ async function fetchZipBundle(job, chapters, providerInfo) {
   if (names.length === 0) throw new Error("ZIP contained no PDFs.");
   jobLog(job, `Extracted ${names.length} PDFs from ZIP`, "log-ok");
 
-  return names.map((n) => toBase64(entries[n]));
+  return names.map((n) => entries[n]);
 }
 
-// --- Merge a list of base64 PDFs in order with pdf-lib ---
+// --- Merge a list of PDFs (Uint8Arrays) in order with pdf-lib ---
+// Entries are released as they are merged so the chapter bytes can be reclaimed.
 
-async function mergePdfList(job, pdfBase64List) {
+async function mergePdfList(job, pdfList) {
   jobProgress(job, "Merging PDFs...");
-  jobLog(job, `Merging ${pdfBase64List.length} PDFs...`, "");
+  jobLog(job, `Merging ${pdfList.length} PDFs...`, "");
 
   const { PDFDocument } = PDFLib;
   const mergedPdf = await PDFDocument.create();
 
-  for (let k = 0; k < pdfBase64List.length; k++) {
+  for (let k = 0; k < pdfList.length; k++) {
     try {
-      const binary = atob(pdfBase64List[k]);
-      const bytes = new Uint8Array(binary.length);
-      for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
-      const doc = await PDFDocument.load(bytes.buffer, { ignoreEncryption: true });
+      const bytes = pdfList[k];
+      pdfList[k] = null;
+      const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
       const pages = await mergedPdf.copyPages(doc, doc.getPageIndices());
       pages.forEach((page) => mergedPdf.addPage(page));
       jobLog(job, `  Merged #${k + 1}: ${doc.getPageCount()} pages`, "");
@@ -710,8 +873,8 @@ async function runJob(job, chapters, settings, providerInfo) {
   job.totalSteps = canTryZip ? 3 : canTryWholeBook ? 2 : chapters.length * 2 + 1;
 
   try {
-    let pdfBase64List = [];
-    let wholeBookBase64 = null;
+    let pdfList = [];
+    let wholeBook = null;
 
     if (providerInfo?.wholeBookPdfUrl && !canTryWholeBook) {
       jobLog(job, "Not all chapters selected — downloading chapters individually", "");
@@ -719,36 +882,37 @@ async function runJob(job, chapters, settings, providerInfo) {
 
     if (canTryWholeBook) {
       try {
-        wholeBookBase64 = await fetchWholeBook(job, providerInfo);
+        wholeBook = await fetchWholeBook(job, providerInfo);
       } catch (wbErr) {
         jobLog(job, `Full-book PDF failed: ${wbErr.message} — falling back to per-chapter`, "log-warn");
         job.totalSteps = chapters.length * 2 + 1;
         job.progress = 0;
-        pdfBase64List = await fetchPerChapter(job, chapters, settings, providerInfo);
+        pdfList = await fetchPerChapter(job, chapters, settings, providerInfo);
       }
     } else if (canTryZip) {
       try {
-        pdfBase64List = await fetchZipBundle(job, chapters, providerInfo);
+        pdfList = await fetchZipBundle(job, chapters, providerInfo);
       } catch (zipErr) {
         jobLog(job, `ZIP failed: ${zipErr.message} — falling back to per-chapter`, "log-warn");
         job.totalSteps = chapters.length * 2 + 1;
         job.progress = 0;
-        pdfBase64List = await fetchPerChapter(job, chapters, settings, providerInfo);
+        pdfList = await fetchPerChapter(job, chapters, settings, providerInfo);
       }
     } else {
-      pdfBase64List = await fetchPerChapter(job, chapters, settings, providerInfo);
+      pdfList = await fetchPerChapter(job, chapters, settings, providerInfo);
     }
 
-    if (!wholeBookBase64 && pdfBase64List.length === 0) throw new Error("No PDFs downloaded.");
+    if (!wholeBook && pdfList.length === 0) throw new Error("No PDFs downloaded.");
 
-    let b64;
-    if (wholeBookBase64) {
+    let outBytes;
+    if (wholeBook) {
       // Save the publisher's file untouched (keeps its bookmarks/outline).
       jobProgress(job, "Saving full-book PDF...");
-      b64 = wholeBookBase64;
+      outBytes = wholeBook;
     } else {
-      b64 = toBase64(await mergePdfList(job, pdfBase64List));
+      outBytes = await mergePdfList(job, pdfList);
     }
+    pdfList = wholeBook = null;
 
     // Step 4: Save via offscreen blob URL
     const sanitizedTitle = job.bookTitle.replace(/[<>:"/\\|?*]/g, "").trim();
@@ -757,21 +921,26 @@ async function runJob(job, chapters, settings, providerInfo) {
       : `${sanitizedTitle}.pdf`;
 
     await ensureOffscreen();
-    const blobUrl = await createBlobUrlViaOffscreen(b64);
+    const blobUrl = await createBlobUrlViaOffscreen(outBytes);
+    outBytes = null;
 
-    await new Promise((resolve, reject) => {
-      chrome.downloads.download(
-        { url: blobUrl, filename, saveAs: false },
-        (downloadId) => {
+    try {
+      const downloadId = await new Promise((resolve, reject) => {
+        chrome.downloads.download({ url: blobUrl, filename, saveAs: false }, (id) => {
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message));
           } else {
-            jobLog(job, `Saved: ${filename}`, "log-ok");
-            resolve();
+            resolve(id);
           }
-        }
-      );
-    });
+        });
+      });
+      // Keep the blob (and the offscreen document) alive until Chrome has written it.
+      const { state, error } = await waitForDownload(downloadId);
+      if (state === "interrupted") throw new Error(`Download interrupted (${error || "unknown reason"})`);
+      jobLog(job, `Saved: ${filename}`, "log-ok");
+    } finally {
+      revokeBlobUrl(blobUrl);
+    }
 
     job.phase = "done";
     jobLog(job, "Complete!", "log-ok");

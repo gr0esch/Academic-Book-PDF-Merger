@@ -66,6 +66,11 @@
           // CSS selector to find the PDF link on chapter pages
           pdfLinkSelector: "a.article-pdfLink[href*='.pdf']",
           pdfLinkFallback: "a[href*='chapter-ag-pdf']",
+          // The TOC has no PDF links, so every chapter costs a page lookup plus a
+          // download; work on a few at a time, and skip the hidden tab when a plain
+          // fetch already returns the PDF.
+          concurrency: 3,
+          directFetch: true,
         };
       },
     },
