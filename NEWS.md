@@ -21,9 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     inside the book tab (`fetchMethod: "page"`). Nothing institution-specific is used.
   - Terms-and-conditions and captcha / bot-check pages stop the job with an
     actionable message instead of a PDF parse error.
-- **Provider contract:** optional per-chapter `pdfUrl`, `accessible` and `access`;
-  optional pacing fields `minDelayMs`, `retryStatuses`, `retryBaseDelayMs`; and
-  `abortOnBlock`. OUP and CUP don't set them and behave as before.
+- **Provider contract:** optional per-chapter `accessible` (`false` = shown unchecked but
+  still requestable, unlike De Gruyter Brill's `noAccess`, which is skipped) and `access`
+  (display label in the popup); optional pacing fields `minDelayMs`, `retryStatuses`,
+  `retryBaseDelayMs`; and `abortOnBlock`. Other providers don't set them and behave as before.
 
 ### Manifest
 
