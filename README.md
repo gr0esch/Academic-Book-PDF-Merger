@@ -19,6 +19,7 @@ This extension adds a one-click workflow: select chapters, click merge, get a si
 | JSTOR     | Planned ([#4](https://github.com/gr0esch/Academic-Book-PDF-Merger/issues/4)) | |
 | Springer | Planned | |
 | Wiley | Planned | |
+| De Gruyter Brill | Supported | `degruyterbrill.com` |
 
 ## Features
 
@@ -48,10 +49,10 @@ _Not yet published._
 
 ## Usage
 
-1. Navigate to a supported publisher's book page (e.g., a book on `academic.oup.com`)
+1. Navigate to a supported publisher's book page (e.g., a book on `academic.oup.com`, or a `degruyterbrill.com/document/doi/.../html` book page)
 2. Click the extension icon in the toolbar
 3. The chapter list appears with all chapters selected by default
-4. Deselect any chapters you don't need (front matter, index, etc.)
+4. Deselect any chapters you don't need (front matter, index, etc.). Chapters the page marks as not licensed for you are shown as "no access" and start unchecked
 5. Click **Download & Merge PDF**
 6. The job runs in the background -- you can close the popup, switch tabs, or queue more books
 7. The merged PDF is saved to your Downloads folder (subfolder configurable in settings)
@@ -70,9 +71,9 @@ Right-click the extension icon and select **Options**, or go to `chrome://extens
 
 1. **Content script** detects the publisher and scrapes the chapter list from the book's table of contents page
 2. **Background service worker** orchestrates the merge job:
-   - For each chapter, fetches the chapter page (in the page's context, with your session cookies) to find the PDF download link
-   - Opens each PDF URL in a hidden background tab (browser-native request, uses your authentication)
-   - Extracts the PDF bytes from the loaded tab
+   - Finds each chapter's PDF URL: taken straight from the table of contents where the publisher lists it (De Gruyter Brill), otherwise by fetching the chapter page (in the page's context, with your session cookies)
+   - Downloads each PDF either in a hidden background tab (OUP) or with a fetch from your own book tab (CUP, De Gruyter Brill), so your session cookies and any bot-protection token are sent; responses are checked to really be PDFs
+   - Uses a single bulk download instead when the publisher offers one (CUP chapter ZIP; De Gruyter Brill full-book PDF when all chapters are selected)
    - Merges all PDFs in order using pdf-lib
    - Triggers the final download via the Chrome downloads API
 
@@ -90,6 +91,7 @@ extension/
     options.html/js     # Settings page
   lib/
     pdf-lib.min.js      # PDF merging library (client-side)
+    fflate.min.js       # ZIP extraction (CUP bulk download)
   icons/
     icon16/48/128.png   # Extension icons
 ```
@@ -108,6 +110,8 @@ extension/
      scrape() {
        // Return { provider, bookTitle, baseUrl, chapters, pdfLinkSelector, pdfLinkFallback }
        // chapters: [{ id, number, title, section, href }]
+       // Optional: pdfMetaName, fetchMethod: "page", zipUrlTemplate (CUP),
+       // wholeBookPdfUrl + totalChapters, noAccessOnHtml; per chapter: pdfUrl, noAccess
      },
    }
    ```

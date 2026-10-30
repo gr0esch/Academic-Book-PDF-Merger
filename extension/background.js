@@ -72,6 +72,18 @@ async function withRetry(job, fn, { attempts = 3, baseDelayMs = 2000 } = {}) {
   return result;
 }
 
+// For providers that set `noAccessOnHtml`: a PDF URL answered with an auth
+// refusal or an HTML page (login wall / landing page) means "not licensed".
+function looksLikeNoAccess(result) {
+  if (!result) return false;
+  if (result.status === 401 || result.status === 403) return true;
+  if (/html/.test(result.contentType || "")) return true;
+  return /^\s*<(!doctype|html)/i.test(result.preview || "");
+}
+
+const BOT_CHECK_HINT =
+  "blocked by the site's bot protection — reload the book page in this tab (complete any check it shows), then retry";
+
 function formatBytes(bytes) {
   if (bytes < 1024) return bytes + " B";
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
@@ -176,15 +188,21 @@ async function _pageFetchPdfUrl(chapterUrl, primarySelector, fallbackSelector, m
 async function _pageFetchBinary(url, expectedTypeSubstrings) {
   try {
     const resp = await fetch(url, { credentials: "same-origin" });
-    if (!resp.ok) return { error: `HTTP ${resp.status}`, status: resp.status, finalUrl: resp.url };
+    // AWS WAF (used by e.g. De Gruyter Brill) flags challenge/CAPTCHA answers here.
+    const wafAction = resp.headers.get("x-amzn-waf-action") || "";
+    if (!resp.ok) {
+      return { error: `HTTP ${resp.status}`, status: resp.status, finalUrl: resp.url, wafAction };
+    }
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
     if (Array.isArray(expectedTypeSubstrings) && expectedTypeSubstrings.length > 0) {
       const match = expectedTypeSubstrings.some((t) => ct.includes(t));
       if (!match) {
         return {
           error: `Wrong content-type: ${ct || "unknown"}`,
+          status: resp.status,
           contentType: ct,
           finalUrl: resp.url,
+          wafAction,
         };
       }
     }
@@ -209,8 +227,10 @@ async function _pageFetchBinary(url, expectedTypeSubstrings) {
         }
         return {
           error: `Not a PDF (starts with ${JSON.stringify(head)}, size=${bytes.length})`,
+          status: resp.status,
           contentType: ct,
           finalUrl: resp.url,
+          wafAction,
           preview,
         };
       }
@@ -312,10 +332,24 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
 
   // Step 1: Find PDF URLs
   const pdfEntries = [];
+  let skippedNoAccess = 0;
   for (let i = 0; i < chapters.length; i++) {
     const ch = chapters[i];
     const label = ch.number ? `Ch. ${ch.number}: ${ch.title}` : ch.title;
     jobProgress(job, `Finding PDF ${i + 1}/${chapters.length}: ${label}`);
+
+    // The book page already said this chapter is not licensed: don't request it.
+    if (ch.noAccess) {
+      skippedNoAccess++;
+      jobLog(job, `No access: ${label} — not licensed for your account (skipped)`, "log-warn");
+      continue;
+    }
+    // Provider already scraped the PDF URL from the TOC: no chapter-page fetch.
+    if (ch.pdfUrl) {
+      pdfEntries.push({ url: ch.pdfUrl, label });
+      jobLog(job, `Found: ${label}`, "log-ok");
+      continue;
+    }
 
     const result = await withRetry(job, () =>
       runInMainWorld(job.tabId, _pageFetchPdfUrl, [
@@ -339,10 +373,18 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
     if (i < chapters.length - 1) await sleepWithJitter(settings.delayMs || 500);
   }
 
-  if (pdfEntries.length === 0) throw new Error("No PDF links found.");
+  if (pdfEntries.length === 0) {
+    throw new Error(
+      skippedNoAccess > 0
+        ? "No access: none of the selected chapters are licensed for your account. Sign in on the book page (institution or personal account), reload it, and try again."
+        : "No PDF links found."
+    );
+  }
 
   // Step 2: Download PDFs via hidden tabs
   const pdfBase64List = [];
+  let failedNoAccess = 0;
+  let botBlocked = "";
   for (let i = 0; i < pdfEntries.length; i++) {
     const { url, label } = pdfEntries[i];
     jobProgress(job, `Downloading ${i + 1}/${pdfEntries.length}: ${label}`);
@@ -364,7 +406,19 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
       } else {
         const looksLikePaywall =
           result?.finalUrl && /\/core\/books\/abs\//i.test(result.finalUrl);
-        if (looksLikePaywall) {
+        if (result?.wafAction) {
+          // Stop instead of hitting the remaining chapters while challenged.
+          botBlocked = result.wafAction;
+          jobLog(job, `Failed: ${label} — ${BOT_CHECK_HINT} (WAF: ${result.wafAction})`, "log-error");
+          break;
+        } else if (providerInfo?.noAccessOnHtml && looksLikeNoAccess(result)) {
+          failedNoAccess++;
+          jobLog(
+            job,
+            `Failed: ${label} — no access (server returned ${result.status === 401 || result.status === 403 ? "HTTP " + result.status : "a web page"} instead of the PDF)`,
+            "log-error"
+          );
+        } else if (looksLikePaywall) {
           jobLog(
             job,
             `Failed: ${label} — no access (CUP redirected to abstract page)`,
@@ -386,7 +440,39 @@ async function fetchPerChapter(job, chapters, settings, providerInfo) {
     if (i < pdfEntries.length - 1) await sleepWithJitter(settings.delayMs || 500);
   }
 
+  if (botBlocked) {
+    throw new Error(`Stopped: ${BOT_CHECK_HINT} (WAF: ${botBlocked}).`);
+  }
+  if (pdfBase64List.length === 0 && failedNoAccess > 0) {
+    throw new Error(
+      "No access: the site did not return any PDFs for your current session. Sign in on the book page (institution or personal account), reload it, and try again."
+    );
+  }
+
   return pdfBase64List;
+}
+
+// --- Whole-book path: one GET for the publisher's full-book PDF ---
+
+async function fetchWholeBook(job, providerInfo) {
+  const url = providerInfo.wholeBookPdfUrl;
+  jobProgress(job, "Fetching whole-book PDF...");
+  jobLog(job, `Book offers a full-book PDF — requesting it from ${new URL(url).host}...`, "");
+
+  const result = await withRetry(job, () =>
+    runInMainWorld(job.tabId, _pageFetchBinary, [url, ["pdf"]])
+  );
+  if (!result) throw new Error("No response from page fetch");
+  if (isRetriable(result)) throw new Error(`HTTP ${result.status} (rate-limited)`);
+  if (result.wafAction) throw new Error(`${BOT_CHECK_HINT} (WAF: ${result.wafAction})`);
+  if (!result.base64) {
+    if (providerInfo.noAccessOnHtml && looksLikeNoAccess(result)) {
+      throw new Error("no access to the full-book PDF");
+    }
+    throw new Error(result.error || "no data");
+  }
+  jobLog(job, `Downloaded full book: ${formatBytes(result.size)}`, "log-ok");
+  return result.base64;
 }
 
 // --- CUP ZIP path: one GET, unzip in service worker ---
@@ -432,18 +518,68 @@ async function fetchZipBundle(job, chapters, providerInfo) {
   return names.map((n) => toBase64(entries[n]));
 }
 
+// --- Merge a list of base64 PDFs in order with pdf-lib ---
+
+async function mergePdfList(job, pdfBase64List) {
+  jobProgress(job, "Merging PDFs...");
+  jobLog(job, `Merging ${pdfBase64List.length} PDFs...`, "");
+
+  const { PDFDocument } = PDFLib;
+  const mergedPdf = await PDFDocument.create();
+
+  for (let k = 0; k < pdfBase64List.length; k++) {
+    try {
+      const binary = atob(pdfBase64List[k]);
+      const bytes = new Uint8Array(binary.length);
+      for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
+      const doc = await PDFDocument.load(bytes.buffer, { ignoreEncryption: true });
+      const pages = await mergedPdf.copyPages(doc, doc.getPageIndices());
+      pages.forEach((page) => mergedPdf.addPage(page));
+      jobLog(job, `  Merged #${k + 1}: ${doc.getPageCount()} pages`, "");
+    } catch (err) {
+      jobLog(job, `  Skip #${k + 1}: ${err.message}`, "log-warn");
+    }
+  }
+
+  if (mergedPdf.getPageCount() === 0) throw new Error("Merge produced 0 pages.");
+
+  const mergedBytes = await mergedPdf.save();
+  jobLog(job, `Total: ${mergedPdf.getPageCount()} pages, ${formatBytes(mergedBytes.length)}`, "log-ok");
+  return mergedBytes;
+}
+
 // --- Run a single merge job ---
 
 async function runJob(job, chapters, settings, providerInfo) {
   job.phase = "working";
   const provider = providerInfo?.provider || "oup";
   const canTryZip = provider === "cup" && providerInfo?.zipUrlTemplate;
-  job.totalSteps = canTryZip ? 3 : chapters.length * 2 + 1;
+  // A full-book PDF only replaces the merge when the user kept every chapter.
+  const canTryWholeBook =
+    !canTryZip &&
+    !!providerInfo?.wholeBookPdfUrl &&
+    providerInfo?.fetchMethod === "page" &&
+    chapters.length === providerInfo.totalChapters;
+  job.totalSteps = canTryZip ? 3 : canTryWholeBook ? 2 : chapters.length * 2 + 1;
 
   try {
     let pdfBase64List = [];
+    let wholeBookBase64 = null;
 
-    if (canTryZip) {
+    if (providerInfo?.wholeBookPdfUrl && !canTryWholeBook) {
+      jobLog(job, "Not all chapters selected — downloading chapters individually", "");
+    }
+
+    if (canTryWholeBook) {
+      try {
+        wholeBookBase64 = await fetchWholeBook(job, providerInfo);
+      } catch (wbErr) {
+        jobLog(job, `Full-book PDF failed: ${wbErr.message} — falling back to per-chapter`, "log-warn");
+        job.totalSteps = chapters.length * 2 + 1;
+        job.progress = 0;
+        pdfBase64List = await fetchPerChapter(job, chapters, settings, providerInfo);
+      }
+    } else if (canTryZip) {
       try {
         pdfBase64List = await fetchZipBundle(job, chapters, providerInfo);
       } catch (zipErr) {
@@ -456,36 +592,18 @@ async function runJob(job, chapters, settings, providerInfo) {
       pdfBase64List = await fetchPerChapter(job, chapters, settings, providerInfo);
     }
 
-    if (pdfBase64List.length === 0) throw new Error("No PDFs downloaded.");
+    if (!wholeBookBase64 && pdfBase64List.length === 0) throw new Error("No PDFs downloaded.");
 
-    // Step 3: Merge
-    jobProgress(job, "Merging PDFs...");
-    jobLog(job, `Merging ${pdfBase64List.length} PDFs...`, "");
-
-    const { PDFDocument } = PDFLib;
-    const mergedPdf = await PDFDocument.create();
-
-    for (let k = 0; k < pdfBase64List.length; k++) {
-      try {
-        const binary = atob(pdfBase64List[k]);
-        const bytes = new Uint8Array(binary.length);
-        for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
-        const doc = await PDFDocument.load(bytes.buffer, { ignoreEncryption: true });
-        const pages = await mergedPdf.copyPages(doc, doc.getPageIndices());
-        pages.forEach((page) => mergedPdf.addPage(page));
-        jobLog(job, `  Merged #${k + 1}: ${doc.getPageCount()} pages`, "");
-      } catch (err) {
-        jobLog(job, `  Skip #${k + 1}: ${err.message}`, "log-warn");
-      }
+    let b64;
+    if (wholeBookBase64) {
+      // Save the publisher's file untouched (keeps its bookmarks/outline).
+      jobProgress(job, "Saving full-book PDF...");
+      b64 = wholeBookBase64;
+    } else {
+      b64 = toBase64(await mergePdfList(job, pdfBase64List));
     }
 
-    if (mergedPdf.getPageCount() === 0) throw new Error("Merge produced 0 pages.");
-
-    const mergedBytes = await mergedPdf.save();
-    jobLog(job, `Total: ${mergedPdf.getPageCount()} pages, ${formatBytes(mergedBytes.length)}`, "log-ok");
-
     // Step 4: Save via offscreen blob URL
-    const b64 = toBase64(mergedBytes);
     const sanitizedTitle = job.bookTitle.replace(/[<>:"/\\|?*]/g, "").trim();
     const filename = settings.downloadFolder
       ? `${settings.downloadFolder}/${sanitizedTitle}.pdf`
