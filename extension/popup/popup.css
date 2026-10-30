@@ -111,6 +111,13 @@ header h1 {
   white-space: nowrap;
 }
 
+.chapter-item .chapter-noaccess {
+  flex-shrink: 0;
+  margin-left: 6px;
+  font-size: 11px;
+  color: #a33;
+}
+
 /* Buttons */
 .btn {
   padding: 4px 10px;

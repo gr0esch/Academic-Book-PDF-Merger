@@ -111,7 +111,8 @@
 
       const cb = document.createElement("input");
       cb.type = "checkbox";
-      cb.checked = true;
+      // Chapters the page marks as not licensed start unchecked.
+      cb.checked = !ch.noAccess;
       cb.dataset.index = idx;
       cb.addEventListener("change", updateCount);
 
@@ -127,6 +128,12 @@
       item.appendChild(cb);
       item.appendChild(num);
       item.appendChild(title);
+      if (ch.noAccess) {
+        const tag = document.createElement("span");
+        tag.className = "chapter-noaccess";
+        tag.textContent = "no access";
+        item.appendChild(tag);
+      }
       $chapters.appendChild(item);
     });
 
@@ -186,6 +193,9 @@
         bookId: bookData.bookId,
         zipUrlTemplate: bookData.zipUrlTemplate,
         fetchMethod: bookData.fetchMethod,
+        wholeBookPdfUrl: bookData.wholeBookPdfUrl,
+        totalChapters: bookData.totalChapters,
+        noAccessOnHtml: bookData.noAccessOnHtml,
       },
     });
   });
