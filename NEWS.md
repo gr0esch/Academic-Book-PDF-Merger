@@ -53,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Downloaded files are kept as bytes end to end. They are no longer base64-encoded and
   decoded again for every chapter, ZIP entry and merge step, which cuts memory use for
   large books.
+- **JSTOR: cover pages are removed before merging**
+  ([#11](https://github.com/gr0esch/Academic-Book-PDF-Merger/issues/11)).
+  JSTOR adds a cover page with a citation and terms notice to every chapter PDF. Before
+  this change, the merged book had one of these in front of every chapter. A first page
+  counts as a cover only if it has a link annotation to the stable URL of this book or one
+  of its chapters on `jstor.org` / `jstor.com`. Text matching can't be used, because the
+  cover's text is not stored as readable strings and every body page has the same
+  `about.jstor.org/terms` footer. A chapter's only page is never removed, and each removal
+  is logged in the job log. Other providers are unaffected.
 
 ### Fixed
 
@@ -66,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Manifest
 
 - Added `*://*.jstor.org/*` to `host_permissions`.
+- Shortened `description` to 123 characters. The Chrome Web Store rejects descriptions
+  longer than 132 characters, and the 1.1.1 draft had 180.
 
 ## [1.1.0] — 2026-05-11
 

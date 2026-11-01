@@ -72,6 +72,7 @@ Right-click the extension icon and select **Options**, or go to `chrome://extens
 - Works on book pages (`jstor.org/stable/<book id>`) for any kind of access: institutional IP range, Shibboleth/OpenAthens login, or a personal JSTOR account. Journal articles and journal issues are not handled.
 - Chapters JSTOR marks as outside your access are listed but unchecked, tagged "no access"; open-access chapters are tagged "open access".
 - The first time you download from JSTOR in a session, JSTOR may ask you to accept its Terms and Conditions. The extension does not accept them for you: if the job stops with that message, click **Download** on one chapter in the book tab, accept, and start the merge again.
+- JSTOR puts a cover page (citation, stable URL, terms-of-use notice) in front of every chapter PDF. The extension removes these before merging, so the merged book has only the book's own pages. A page is removed only if it links to the stable URL of this book or one of its chapters, and a chapter's only page is never removed. The "This content downloaded from…" footer JSTOR adds to each page is left as-is.
 - To avoid JSTOR's bot protection, requests are spaced at least 3 seconds apart (with jitter), 403/429 responses are retried with backoff, and the job stops immediately if a captcha or bot check appears.
 - If you reach JSTOR through a proxy that rewrites the hostname (e.g. `www-jstor-org.ezproxy.<university>.edu`), the page is outside the extension's host permissions and may not work.
 
