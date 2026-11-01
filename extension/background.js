@@ -828,30 +828,92 @@ async function fetchZipBundle(job, chapters, providerInfo) {
   return names.map((n) => entries[n]);
 }
 
+// --- JSTOR cover pages ---
+// JSTOR puts a generated cover page (citation, stable URL, terms-of-use notice) in front
+// of every PDF it serves. Text matching can't find it: the cover's text is set in an
+// Identity-H font (no readable strings in the content stream), and every body page carries
+// the same "about.jstor.org/terms" footer. What the cover reliably has is a link
+// annotation to the item's own stable URL (www.jstor.org/stable/<id>, sometimes
+// jstor.com). A first page counts as a cover only when it links to one of *this book's*
+// stable IDs, so a chapter whose first page merely cites another JSTOR item is kept.
+
+// Stable IDs (lower-cased) that a page's URI link annotations point to on jstor.org/.com.
+function jstorStableLinkIds(page) {
+  const { PDFName, PDFDict, PDFString, PDFHexString } = PDFLib;
+  const ids = [];
+  const annots = page.node.Annots();
+  if (!annots) return ids;
+  for (let i = 0; i < annots.size(); i++) {
+    try {
+      const annot = annots.lookupMaybe(i, PDFDict);
+      const action = annot && annot.lookupMaybe(PDFName.of("A"), PDFDict);
+      const uri = action && action.lookupMaybe(PDFName.of("URI"), PDFString, PDFHexString);
+      if (!uri) continue;
+      const url = new URL(uri.decodeText());
+      if (!/(^|\.)jstor\.(org|com)$/i.test(url.hostname)) continue;
+      const m = url.pathname.match(/^\/stable\/(?!pdf\/)(.+?)\/?$/i);
+      if (m) ids.push(decodeURIComponent(m[1]).toLowerCase());
+    } catch {
+      // Malformed annotation or URI: not a cover marker.
+    }
+  }
+  return ids;
+}
+
+function isJstorCoverPage(page, ownIds) {
+  return jstorStableLinkIds(page).some((id) => ownIds.has(id));
+}
+
+// Lower-cased stable IDs of the book and the chapters being merged.
+function jstorOwnIds(chapters, providerInfo) {
+  return new Set(
+    [providerInfo?.bookId, ...chapters.map((ch) => ch.id)]
+      .filter(Boolean)
+      .map((id) => String(id).toLowerCase())
+  );
+}
+
 // --- Merge a list of PDFs (Uint8Arrays) in order with pdf-lib ---
 // Entries are released as they are merged so the chapter bytes can be reclaimed.
+// `jstorCoverIds` (a Set of stable IDs) turns on JSTOR cover-page removal.
 
-async function mergePdfList(job, pdfList) {
+async function mergePdfList(job, pdfList, { jstorCoverIds = null } = {}) {
   jobProgress(job, "Merging PDFs...");
   jobLog(job, `Merging ${pdfList.length} PDFs...`, "");
 
   const { PDFDocument } = PDFLib;
   const mergedPdf = await PDFDocument.create();
+  let coversRemoved = 0;
 
   for (let k = 0; k < pdfList.length; k++) {
     try {
       const bytes = pdfList[k];
       pdfList[k] = null;
       const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
-      const pages = await mergedPdf.copyPages(doc, doc.getPageIndices());
+      let indices = doc.getPageIndices();
+      // Never drop a chapter's only page, whatever it looks like.
+      const dropCover =
+        !!jstorCoverIds && indices.length > 1 && isJstorCoverPage(doc.getPage(0), jstorCoverIds);
+      if (dropCover) {
+        indices = indices.slice(1);
+        coversRemoved++;
+      }
+      const pages = await mergedPdf.copyPages(doc, indices);
       pages.forEach((page) => mergedPdf.addPage(page));
-      jobLog(job, `  Merged #${k + 1}: ${doc.getPageCount()} pages`, "");
+      jobLog(
+        job,
+        `  Merged #${k + 1}: ${indices.length} pages${dropCover ? " (JSTOR cover page removed)" : ""}`,
+        ""
+      );
     } catch (err) {
       jobLog(job, `  Skip #${k + 1}: ${err.message}`, "log-warn");
     }
   }
 
   if (mergedPdf.getPageCount() === 0) throw new Error("Merge produced 0 pages.");
+  if (coversRemoved > 0) {
+    jobLog(job, `Removed ${coversRemoved} JSTOR cover page${coversRemoved === 1 ? "" : "s"}`, "");
+  }
 
   const mergedBytes = await mergedPdf.save();
   jobLog(job, `Total: ${mergedPdf.getPageCount()} pages, ${formatBytes(mergedBytes.length)}`, "log-ok");
@@ -910,7 +972,9 @@ async function runJob(job, chapters, settings, providerInfo) {
       jobProgress(job, "Saving full-book PDF...");
       outBytes = wholeBook;
     } else {
-      outBytes = await mergePdfList(job, pdfList);
+      outBytes = await mergePdfList(job, pdfList, {
+        jstorCoverIds: provider === "jstor" ? jstorOwnIds(chapters, providerInfo) : null,
+      });
     }
     pdfList = wholeBook = null;
 

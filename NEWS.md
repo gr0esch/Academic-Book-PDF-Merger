@@ -5,6 +5,25 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **JSTOR: cover pages are removed before merging**
+  ([#11](https://github.com/gr0esch/Academic-Book-PDF-Merger/issues/11)).
+  JSTOR adds a cover page with a citation and terms notice to every chapter PDF. Before
+  this change, the merged book had one of these in front of every chapter. A first page
+  counts as a cover only if it has a link annotation to the stable URL of this book or one
+  of its chapters on `jstor.org` / `jstor.com`. Text matching can't be used, because the
+  cover's text is not stored as readable strings and every body page has the same
+  `about.jstor.org/terms` footer. A chapter's only page is never removed, and each removal
+  is logged in the job log. Other providers are unaffected.
+
+### Fixed
+
+- Shortened the manifest `description` to 123 characters. The Chrome Web Store rejects
+  descriptions longer than 132 characters, and the old one had 180.
+
 ## [1.1.1] — 2026-10-30
 
 ### Added
